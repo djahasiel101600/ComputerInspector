@@ -450,7 +450,8 @@ class LaptopInspectorApp(QMainWindow):
             specs['System'] = {
                 'OS': f"{platform.system()} {platform.version()}",
                 'Architecture': platform.architecture()[0],
-                'Hostname': platform.node()
+                'Hostname': platform.node(),
+                'System Serial': self.get_system_serial_number()  # Add this line
             }
             
             # BIOS/Serial Information
@@ -538,24 +539,127 @@ class LaptopInspectorApp(QMainWindow):
             return {'Status': 'Battery info unavailable'}
 
     def get_bios_info(self):
-        """Get BIOS information"""
+        """Get comprehensive BIOS information"""
         try:
             if platform.system() == "Windows":
+                # First try the WMI method
+                bios_info = {}
+                
+                # Get BIOS Serial Number
                 result = subprocess.run([
                     'wmic', 'bios', 'get', 'serialnumber'
                 ], capture_output=True, text=True, shell=True)
                 
                 lines = [line.strip() for line in result.stdout.split('\n') 
                         if line.strip() and 'SerialNumber' not in line]
-                serial = lines[0] if lines else "Not available"
+                bios_serial = lines[0] if lines else None
                 
-                return {
-                    'Serial Number': serial,
-                    'BIOS Version': 'Use wmic bios get version for details'
-                }
+                # Get BIOS Version
+                result = subprocess.run([
+                    'wmic', 'bios', 'get', 'version'
+                ], capture_output=True, text=True, shell=True)
+                
+                lines = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'Version' not in line]
+                bios_version = lines[0] if lines else None
+                
+                # If WMI failed, try PowerShell
+                if not bios_serial or bios_serial in ['', '0', 'None', 'To be filled by O.E.M.']:
+                    ps_bios_info = self.get_bios_info_powershell()
+                    if 'Serial Number' in ps_bios_info and ps_bios_info['Serial Number'] not in ['Not available', '']:
+                        return ps_bios_info
+                
+                # Continue with WMI data if we have valid info
+                bios_info['Serial Number'] = bios_serial if bios_serial and bios_serial not in ['', '0', 'None', 'To be filled by O.E.M.'] else "Not available"
+                bios_info['Version'] = bios_version if bios_version else "Not available"
+                
+                # Get BIOS Manufacturer
+                result = subprocess.run([
+                    'wmic', 'bios', 'get', 'manufacturer'
+                ], capture_output=True, text=True, shell=True)
+                
+                lines = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'Manufacturer' not in line]
+                bios_info['Manufacturer'] = lines[0] if lines else "Not available"
+                
+                # Get BIOS Release Date
+                result = subprocess.run([
+                    'wmic', 'bios', 'get', 'releasedate'
+                ], capture_output=True, text=True, shell=True)
+                
+                lines = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'ReleaseDate' not in line]
+                if lines and lines[0]:
+                    # Format date from YYYYMMDD to YYYY-MM-DD
+                    date_str = lines[0]
+                    if len(date_str) >= 8:
+                        formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                        bios_info['Release Date'] = formatted_date
+                    else:
+                        bios_info['Release Date'] = lines[0]
+                else:
+                    bios_info['Release Date'] = "Not available"
+                
+                return bios_info
+            else:
+                return {'Info': 'BIOS info available on Windows only'}
+        except Exception as e:
+            # If WMI fails, try PowerShell as fallback
+            try:
+                return self.get_bios_info_powershell()
+            except:
+                return {'Error': f'Could not retrieve BIOS info: {str(e)}'}
+
+    def get_bios_info_powershell(self):
+        """Get BIOS information using PowerShell (more reliable on some systems)"""
+        try:
+            if platform.system() == "Windows":
+                # Use PowerShell to get BIOS information
+                ps_script = """
+                Get-CimInstance -ClassName Win32_BIOS | Select-Object SerialNumber, Version, Manufacturer, ReleaseDate | ConvertTo-Json
+                """
+                
+                result = subprocess.run([
+                    'powershell', '-Command', ps_script
+                ], capture_output=True, text=True, shell=True)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    bios_data = json.loads(result.stdout)
+                    bios_info = {
+                        'Serial Number': bios_data.get('SerialNumber', 'Not available'),
+                        'Version': bios_data.get('Version', 'Not available'),
+                        'Manufacturer': bios_data.get('Manufacturer', 'Not available'),
+                        'Release Date': bios_data.get('ReleaseDate', 'Not available')
+                    }
+                    return bios_info
+                
             return {'Info': 'BIOS info available on Windows only'}
+        except Exception as e:
+            return {'Error': f'Could not retrieve BIOS info: {str(e)}'}
+
+    def get_system_serial_number(self):
+        """Get system serial number using multiple methods for better compatibility"""
+        try:
+            if platform.system() == "Windows":
+                # Try multiple WMI queries to get serial number
+                wmi_queries = [
+                    ['wmic', 'bios', 'get', 'serialnumber'],
+                    ['wmic', 'csproduct', 'get', 'identifyingnumber'],
+                    ['wmic', 'systemenclosure', 'get', 'serialnumber']
+                ]
+                
+                for query in wmi_queries:
+                    result = subprocess.run(query, capture_output=True, text=True, shell=True)
+                    lines = [line.strip() for line in result.stdout.split('\n') 
+                            if line.strip() and not any(keyword in line.lower() for keyword in ['serialnumber', 'identifyingnumber'])]
+                    
+                    if lines and lines[0] and lines[0] not in ['', '0', 'None', 'To be filled by O.E.M.']:
+                        return lines[0]
+                
+                return "Not available"
+            return "Windows only"
         except:
-            return {'Error': 'Could not retrieve BIOS info'}
+            return "Error retrieving"
 
     def test_network_connectivity(self):
         """Test basic network connectivity"""
