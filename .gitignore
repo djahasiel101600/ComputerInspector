@@ -1,0 +1,88 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.spec
+*.egg-info/
+*.egg
+.eggs/
+wheelhouse/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Byte-compiled / optimized / DLL files
+*.pyd
+*.pyo
+*.so
+*.dll
+*.dylib
+
+# -------------------------
+# PyInstaller
+# -------------------------
+# Files PyInstaller creates
+*.manifest
+*.manifest.json
+*.exe
+*.app
+*.pkg
+
+# Exclude temporary working files
+# (PyInstaller sometimes creates a temporary directory)
+*_pyi_temp/
+
+# PyInstaller cache
+__pyinstaller/
+
+# -------------------------
+# Qt / PySide6
+# -------------------------
+# Qt Designer generated cache
+*.qrc.dep
+
+# Qt resource compiler temp files
+*.qrc.py
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+
+# -------------------------
+# IDE / Editor files
+# -------------------------
+
+# VSCode
+.vscode/
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+
+# Sublime
+*.sublime-project
+*.sublime-workspace
+
+# -------------------------
+# OS Files
+# -------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.d
