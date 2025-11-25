@@ -9,7 +9,9 @@ import subprocess
 import re
 import time
 import random
-from typing import Dict, List, Tuple
+import hashlib
+import base64
+from typing import Dict, List, Tuple, Optional
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                               QWidget, QPushButton, QLabel, QTabWidget, QTextEdit, 
                               QTableWidget, QTableWidgetItem, QGroupBox, QLineEdit,
@@ -27,36 +29,532 @@ from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-class DigitalSignatureDialog(QDialog):
+class LoginDialog(QDialog):
+    """Simple login dialog with encrypted password storage"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Digital Signature")
+        self.setWindowTitle("COA Laptop Inspector - Login")
         self.setModal(True)
-        self.setFixedSize(400, 300)
+        self.setFixedSize(350, 200)
         
         layout = QVBoxLayout()
         
-        # Signature canvas (simplified - would need actual signature capture)
-        self.signature_label = QLabel("Inspector Signature:")
-        layout.addWidget(self.signature_label)
+        # Title
+        title = QLabel("Commission on Audit")
+        title.setAlignment(Qt.AlignCenter)
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+        
+        subtitle = QLabel("Laptop Inspection System")
+        subtitle.setAlignment(Qt.AlignCenter)
+        layout.addWidget(subtitle)
+        
+        layout.addSpacing(20)
+        
+        # Username
+        form_layout = QFormLayout()
+        self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Enter username")
+        form_layout.addRow("Username:", self.username_input)
+        
+        # Password
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setPlaceholderText("Enter password")
+        self.password_input.returnPressed.connect(self.attempt_login)
+        form_layout.addRow("Password:", self.password_input)
+        
+        layout.addLayout(form_layout)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        self.login_button = QPushButton("Login")
+        self.login_button.clicked.connect(self.attempt_login)
+        self.login_button.setDefault(True)
+        
+        self.setup_button = QPushButton("First Time Setup")
+        self.setup_button.clicked.connect(self.first_time_setup)
+        
+        button_layout.addWidget(self.login_button)
+        button_layout.addWidget(self.setup_button)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        self.authenticated = False
+        self.user_info = {}
+        
+        # Check if credentials already exist and hide setup button if they do
+        self.check_and_update_setup_button()
+    
+    def check_and_update_setup_button(self):
+        """Check if credentials exist and update setup button visibility"""
+        creds_file = Path("coa_credentials.dat")
+        if creds_file.exists():
+            # Credentials already exist, hide the setup button
+            self.setup_button.setVisible(False)
+        else:
+            # No credentials, show setup button
+            self.setup_button.setVisible(True)
+    
+    def attempt_login(self):
+        """Attempt to authenticate user"""
+        username = self.username_input.text().strip()
+        password = self.password_input.text()
+        
+        if not username or not password:
+            QMessageBox.warning(self, "Input Error", "Please enter both username and password.")
+            return
+        
+        # Check credentials
+        if self.verify_credentials(username, password):
+            self.authenticated = True
+            self.user_info = {'username': username, 'role': 'inspector'}
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Login Failed", "Invalid username or password.")
+            self.password_input.clear()
+            self.password_input.setFocus()
+    
+    def first_time_setup(self):
+        """First time setup for creating credentials"""
+        # Check if credentials already exist
+        creds_file = Path("coa_credentials.dat")
+        if creds_file.exists():
+            QMessageBox.warning(
+                self, 
+                "Account Already Exists", 
+                "An account already exists.\n\nIf you forgot your password, please contact your system administrator or delete the 'coa_credentials.dat' file to reset."
+            )
+            return
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("First Time Setup")
+        dialog.setModal(True)
+        
+        layout = QVBoxLayout()
+        form_layout = QFormLayout()
+        
+        username_input = QLineEdit()
+        password_input = QLineEdit()
+        password_input.setEchoMode(QLineEdit.Password)
+        confirm_password = QLineEdit()
+        confirm_password.setEchoMode(QLineEdit.Password)
+        
+        form_layout.addRow("Username:", username_input)
+        form_layout.addRow("Password:", password_input)
+        form_layout.addRow("Confirm Password:", confirm_password)
+        
+        layout.addLayout(form_layout)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec():
+            username = username_input.text().strip()
+            password = password_input.text()
+            confirm = confirm_password.text()
+            
+            if not username or not password:
+                QMessageBox.warning(self, "Error", "Username and password cannot be empty.")
+                return
+            
+            if password != confirm:
+                QMessageBox.warning(self, "Error", "Passwords do not match.")
+                return
+            
+            if len(password) < 6:
+                QMessageBox.warning(self, "Error", "Password must be at least 6 characters.")
+                return
+            
+            # Save credentials
+            if self.save_credentials(username, password):
+                QMessageBox.information(self, "Success", "Account created successfully! Please login.")
+                self.username_input.setText(username)
+                self.password_input.setFocus()
+                # Hide the setup button now that account is created
+                self.setup_button.setVisible(False)
+            else:
+                QMessageBox.warning(self, "Error", "Failed to create account.")
+    
+    def hash_password(self, password: str) -> str:
+        """Hash password using SHA-256"""
+        return hashlib.sha256(password.encode()).hexdigest()
+    
+    def save_credentials(self, username: str, password: str) -> bool:
+        """Save encrypted credentials to file"""
+        try:
+            creds_file = Path("coa_credentials.dat")
+            hashed_password = self.hash_password(password)
+            
+            credentials = {
+                'username': username,
+                'password': hashed_password,
+                'created': datetime.now().isoformat()
+            }
+            
+            # Encode to base64 for basic obfuscation
+            encoded = base64.b64encode(json.dumps(credentials).encode()).decode()
+            creds_file.write_text(encoded)
+            return True
+        except Exception as e:
+            print(f"Error saving credentials: {e}")
+            return False
+    
+    def verify_credentials(self, username: str, password: str) -> bool:
+        """Verify user credentials"""
+        try:
+            creds_file = Path("coa_credentials.dat")
+            if not creds_file.exists():
+                return False
+            
+            encoded = creds_file.read_text()
+            credentials = json.loads(base64.b64decode(encoded).decode())
+            
+            return (credentials['username'] == username and 
+                    credentials['password'] == self.hash_password(password))
+        except Exception as e:
+            print(f"Error verifying credentials: {e}")
+            return False
+
+class DigitalSignatureDialog(QDialog):
+    """Enhanced digital signature dialog with certificate generation"""
+    def __init__(self, parent=None, username=""):
+        super().__init__(parent)
+        self.setWindowTitle("Digital Signature & Certificate")
+        self.setModal(True)
+        self.setFixedSize(500, 400)
+        self.username = username
+        
+        layout = QVBoxLayout()
+        
+        # Info section
+        info_label = QLabel("Digital signatures provide authenticity and integrity to inspection reports.")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        layout.addSpacing(10)
+        
+        # Signature section
+        sig_group = QGroupBox("Signatures")
+        sig_layout = QFormLayout()
         
         self.inspector_signature = QLineEdit()
         self.inspector_signature.setPlaceholderText("Enter your full name as signature")
-        layout.addWidget(self.inspector_signature)
+        self.inspector_signature.setText(username)
+        sig_layout.addRow("Inspector Name:*", self.inspector_signature)
+        
+        self.inspector_id = QLineEdit()
+        self.inspector_id.setPlaceholderText("Employee ID or License Number")
+        sig_layout.addRow("Inspector ID:", self.inspector_id)
         
         self.approver_signature = QLineEdit()
-        self.approver_signature.setPlaceholderText("Approver's full name")
-        layout.addWidget(self.approver_signature)
+        self.approver_signature.setPlaceholderText("Approver's full name (optional)")
+        sig_layout.addRow("Approver Name:", self.approver_signature)
         
+        self.approver_id = QLineEdit()
+        self.approver_id.setPlaceholderText("Approver's ID (optional)")
+        sig_layout.addRow("Approver ID:", self.approver_id)
+        
+        sig_group.setLayout(sig_layout)
+        layout.addWidget(sig_group)
+        
+        # Certificate section
+        cert_group = QGroupBox("Digital Certificate")
+        cert_layout = QVBoxLayout()
+        
+        self.generate_cert_check = QCheckBox("Generate digital certificate for this inspection")
+        self.generate_cert_check.setChecked(True)
+        cert_layout.addWidget(self.generate_cert_check)
+        
+        self.cert_info = QLabel("A unique certificate ID will be generated and embedded in the report.")
+        self.cert_info.setWordWrap(True)
+        self.cert_info.setStyleSheet("color: #666; font-size: 9pt;")
+        cert_layout.addWidget(self.cert_info)
+        
+        cert_group.setLayout(cert_layout)
+        layout.addWidget(cert_group)
+        
+        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self.validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         
         self.setLayout(layout)
+        self.certificate_id = None
     
-    def get_signatures(self):
-        return self.inspector_signature.text(), self.approver_signature.text()
+    def validate_and_accept(self):
+        """Validate inputs and generate certificate"""
+        if not self.inspector_signature.text().strip():
+            QMessageBox.warning(self, "Required Field", "Inspector name is required.")
+            return
+        
+        if self.generate_cert_check.isChecked():
+            self.certificate_id = self.generate_certificate()
+        
+        self.accept()
+    
+    def generate_certificate(self) -> str:
+        """Generate a unique certificate ID for this inspection"""
+        timestamp = datetime.now().isoformat()
+        data = f"{self.inspector_signature.text()}{timestamp}{random.randint(1000, 9999)}"
+        cert_hash = hashlib.sha256(data.encode()).hexdigest()[:16].upper()
+        return f"COA-CERT-{cert_hash}"
+    
+    def get_signatures(self) -> Tuple[str, str, str, str, str, Optional[str]]:
+        """Return signature data and certificate ID"""
+        return (
+            self.inspector_signature.text(),
+            self.inspector_id.text(),
+            self.approver_signature.text(),
+            self.approver_id.text(),
+            datetime.now().isoformat(),
+            self.certificate_id
+        )
+
+class PRTemplateDialog(QDialog):
+    """Dialog for creating and managing PR templates"""
+    def __init__(self, parent=None, template_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("PR Template Manager")
+        self.setModal(True)
+        self.setFixedSize(500, 450)
+        
+        layout = QVBoxLayout()
+        
+        # Template info
+        info_group = QGroupBox("Template Information")
+        info_layout = QFormLayout()
+        
+        self.template_name = QLineEdit()
+        self.template_name.setPlaceholderText("e.g., 'Standard Office Laptop 2025'")
+        info_layout.addRow("Template Name:*", self.template_name)
+        
+        self.agency_name = QLineEdit()
+        self.agency_name.setPlaceholderText("Agency or Department")
+        info_layout.addRow("Agency:", self.agency_name)
+        
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+        
+        # Specifications
+        specs_group = QGroupBox("Purchase Request Specifications")
+        specs_layout = QFormLayout()
+        
+        self.pr_cpu = QLineEdit()
+        self.pr_cpu.setPlaceholderText("e.g., Intel Core i5")
+        specs_layout.addRow("Required CPU:*", self.pr_cpu)
+        
+        self.pr_ram = QLineEdit()
+        self.pr_ram.setPlaceholderText("e.g., 8GB")
+        specs_layout.addRow("Required RAM:*", self.pr_ram)
+        
+        self.pr_storage = QLineEdit()
+        self.pr_storage.setPlaceholderText("e.g., 256GB SSD")
+        specs_layout.addRow("Required Storage:*", self.pr_storage)
+        
+        self.pr_graphics = QLineEdit()
+        self.pr_graphics.setPlaceholderText("e.g., Intel UHD Graphics")
+        specs_layout.addRow("Graphics:", self.pr_graphics)
+        
+        self.pr_wifi = QLineEdit()
+        self.pr_wifi.setPlaceholderText("e.g., WiFi 6 (802.11ax)")
+        specs_layout.addRow("WiFi:", self.pr_wifi)
+        
+        self.pr_notes = QLineEdit()
+        self.pr_notes.setPlaceholderText("Additional notes...")
+        specs_layout.addRow("Notes:", self.pr_notes)
+        
+        specs_group.setLayout(specs_layout)
+        layout.addWidget(specs_group)
+        
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setLayout(layout)
+        
+        # Load existing template data if provided
+        if template_data:
+            self.load_template(template_data)
+    
+    def validate_and_accept(self):
+        """Validate required fields"""
+        if not self.template_name.text().strip():
+            QMessageBox.warning(self, "Required", "Template name is required.")
+            return
+        if not all([self.pr_cpu.text().strip(), self.pr_ram.text().strip(), 
+                   self.pr_storage.text().strip()]):
+            QMessageBox.warning(self, "Required", "CPU, RAM, and Storage are required.")
+            return
+        self.accept()
+    
+    def load_template(self, data):
+        """Load template data into form"""
+        self.template_name.setText(data.get('template_name', ''))
+        self.agency_name.setText(data.get('agency_name', ''))
+        self.pr_cpu.setText(data.get('pr_cpu', ''))
+        self.pr_ram.setText(data.get('pr_ram', ''))
+        self.pr_storage.setText(data.get('pr_storage', ''))
+        self.pr_graphics.setText(data.get('pr_graphics', ''))
+        self.pr_wifi.setText(data.get('pr_wifi', ''))
+        self.pr_notes.setText(data.get('pr_notes', ''))
+    
+    def get_template_data(self):
+        """Return template data as dictionary"""
+        return {
+            'template_name': self.template_name.text().strip(),
+            'agency_name': self.agency_name.text().strip(),
+            'pr_cpu': self.pr_cpu.text().strip(),
+            'pr_ram': self.pr_ram.text().strip(),
+            'pr_storage': self.pr_storage.text().strip(),
+            'pr_graphics': self.pr_graphics.text().strip(),
+            'pr_wifi': self.pr_wifi.text().strip(),
+            'pr_notes': self.pr_notes.text().strip()
+        }
+
+class PendingInspectionDialog(QDialog):
+    """Dialog for creating pending inspections"""
+    def __init__(self, parent=None, templates=None, pending_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create Pending Inspection")
+        self.setModal(True)
+        self.setFixedSize(550, 550)
+        self.templates = templates or []
+        
+        layout = QVBoxLayout()
+        
+        # Template selection
+        template_group = QGroupBox("Load from Template (Optional)")
+        template_layout = QHBoxLayout()
+        
+        self.template_combo = QComboBox()
+        self.template_combo.addItem("-- Select a template --", None)
+        for template in self.templates:
+            self.template_combo.addItem(template['template_name'], template)
+        self.template_combo.currentIndexChanged.connect(self.load_from_template)
+        template_layout.addWidget(self.template_combo)
+        
+        template_group.setLayout(template_layout)
+        layout.addWidget(template_group)
+        
+        # Inspection details
+        details_group = QGroupBox("Inspection Details")
+        details_layout = QFormLayout()
+        
+        self.agency_name = QLineEdit()
+        details_layout.addRow("Agency Name:*", self.agency_name)
+        
+        self.pr_number = QLineEdit()
+        details_layout.addRow("PR Number:*", self.pr_number)
+        
+        self.laptop_model = QLineEdit()
+        self.laptop_model.setPlaceholderText("Optional - can be filled during inspection")
+        details_layout.addRow("Laptop Model:", self.laptop_model)
+        
+        self.expected_serial = QLineEdit()
+        self.expected_serial.setPlaceholderText("Optional - if known in advance")
+        details_layout.addRow("Serial Number:", self.expected_serial)
+        
+        details_group.setLayout(details_layout)
+        layout.addWidget(details_group)
+        
+        # PR Specifications
+        specs_group = QGroupBox("Purchase Request Specifications")
+        specs_layout = QFormLayout()
+        
+        self.pr_cpu = QLineEdit()
+        specs_layout.addRow("Required CPU:*", self.pr_cpu)
+        
+        self.pr_ram = QLineEdit()
+        specs_layout.addRow("Required RAM:*", self.pr_ram)
+        
+        self.pr_storage = QLineEdit()
+        specs_layout.addRow("Required Storage:*", self.pr_storage)
+        
+        self.pr_graphics = QLineEdit()
+        specs_layout.addRow("Graphics:", self.pr_graphics)
+        
+        self.pr_wifi = QLineEdit()
+        specs_layout.addRow("WiFi:", self.pr_wifi)
+        
+        self.pr_notes = QLineEdit()
+        specs_layout.addRow("Notes:", self.pr_notes)
+        
+        specs_group.setLayout(specs_layout)
+        layout.addWidget(specs_group)
+        
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setLayout(layout)
+        
+        # Load pending data if editing
+        if pending_data:
+            self.load_pending_data(pending_data)
+    
+    def load_from_template(self):
+        """Load specs from selected template"""
+        template = self.template_combo.currentData()
+        if template:
+            self.agency_name.setText(template.get('agency_name', ''))
+            self.pr_cpu.setText(template.get('pr_cpu', ''))
+            self.pr_ram.setText(template.get('pr_ram', ''))
+            self.pr_storage.setText(template.get('pr_storage', ''))
+            self.pr_graphics.setText(template.get('pr_graphics', ''))
+            self.pr_wifi.setText(template.get('pr_wifi', ''))
+            self.pr_notes.setText(template.get('pr_notes', ''))
+    
+    def validate_and_accept(self):
+        """Validate required fields"""
+        if not all([self.agency_name.text().strip(), self.pr_number.text().strip()]):
+            QMessageBox.warning(self, "Required", "Agency Name and PR Number are required.")
+            return
+        if not all([self.pr_cpu.text().strip(), self.pr_ram.text().strip(), 
+                   self.pr_storage.text().strip()]):
+            QMessageBox.warning(self, "Required", "CPU, RAM, and Storage specifications are required.")
+            return
+        self.accept()
+    
+    def load_pending_data(self, data):
+        """Load pending inspection data"""
+        self.agency_name.setText(data.get('agency_name', ''))
+        self.pr_number.setText(data.get('pr_number', ''))
+        self.laptop_model.setText(data.get('laptop_model', ''))
+        self.expected_serial.setText(data.get('expected_serial', ''))
+        self.pr_cpu.setText(data.get('pr_cpu', ''))
+        self.pr_ram.setText(data.get('pr_ram', ''))
+        self.pr_storage.setText(data.get('pr_storage', ''))
+        self.pr_graphics.setText(data.get('pr_graphics', ''))
+        self.pr_wifi.setText(data.get('pr_wifi', ''))
+        self.pr_notes.setText(data.get('pr_notes', ''))
+    
+    def get_pending_data(self):
+        """Return pending inspection data"""
+        return {
+            'agency_name': self.agency_name.text().strip(),
+            'pr_number': self.pr_number.text().strip(),
+            'laptop_model': self.laptop_model.text().strip(),
+            'expected_serial': self.expected_serial.text().strip(),
+            'pr_cpu': self.pr_cpu.text().strip(),
+            'pr_ram': self.pr_ram.text().strip(),
+            'pr_storage': self.pr_storage.text().strip(),
+            'pr_graphics': self.pr_graphics.text().strip(),
+            'pr_wifi': self.pr_wifi.text().strip(),
+            'pr_notes': self.pr_notes.text().strip()
+        }
 
 class NetworkTestDialog(QDialog):
     def __init__(self, parent=None):
@@ -121,10 +619,13 @@ class NetworkTestDialog(QDialog):
             self.results_text.append(f"✗ Network test error: {str(e)}")
 
 class LaptopInspectorApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, user_info: Dict):
         super().__init__()
-        self.setWindowTitle("COA Laptop Inspection System v2.0")
+        self.setWindowTitle(f"COA Laptop Inspection System v2.5 - User: {user_info['username']}")
         self.setGeometry(100, 100, 1400, 900)
+        
+        # User information
+        self.user_info = user_info
         
         # Initialize database
         self.db_path = Path("coa_inspections.db")
@@ -133,6 +634,10 @@ class LaptopInspectorApp(QMainWindow):
         self.setup_ui()
         self.current_inspection = {}
         self.inspection_results = {}
+        self.current_pending_id = None  # Track if inspection is from pending queue
+        
+        # Set default inspector name
+        QTimer.singleShot(100, lambda: self.inspector_name.setText(user_info['username']))
     
     def init_database(self):
         """Initialize SQLite database for storing inspections"""
@@ -145,21 +650,124 @@ class LaptopInspectorApp(QMainWindow):
                 inspection_date TEXT,
                 inspector_name TEXT,
                 inspector_signature TEXT,
+                inspector_id TEXT,
                 approver_signature TEXT,
+                approver_id TEXT,
+                certificate_id TEXT,
+                signature_timestamp TEXT,
                 agency_name TEXT,
                 pr_number TEXT,
                 serial_number TEXT,
                 laptop_model TEXT,
                 inspection_data TEXT,
                 overall_status TEXT,
+                created_at TEXT,
+                created_by TEXT
+            )
+        ''')
+        
+        # Create audit log table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT,
+                username TEXT,
+                details TEXT,
+                timestamp TEXT
+            )
+        ''')
+        
+        # Create PR templates table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pr_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_name TEXT UNIQUE,
+                agency_name TEXT,
+                pr_cpu TEXT,
+                pr_ram TEXT,
+                pr_storage TEXT,
+                pr_graphics TEXT,
+                pr_wifi TEXT,
+                pr_notes TEXT,
+                created_by TEXT,
+                created_at TEXT
+            )
+        ''')
+        
+        # Create pending inspections table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pending_inspections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agency_name TEXT,
+                pr_number TEXT,
+                laptop_model TEXT,
+                expected_serial TEXT,
+                pr_cpu TEXT,
+                pr_ram TEXT,
+                pr_storage TEXT,
+                pr_graphics TEXT,
+                pr_wifi TEXT,
+                pr_notes TEXT,
+                status TEXT DEFAULT 'pending',
+                created_by TEXT,
                 created_at TEXT
             )
         ''')
         
         conn.commit()
         conn.close()
+    
+    def log_action(self, action: str, details: str = ""):
+        """Log user actions for audit trail"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO audit_log (action, username, details, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (action, self.user_info['username'], details, datetime.now().isoformat()))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error logging action: {e}")
 
     def setup_ui(self):
+        # Create menu bar
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu('File')
+        
+        export_db_action = file_menu.addAction('📦 Export Database')
+        export_db_action.triggered.connect(self.export_database)
+        
+        import_db_action = file_menu.addAction('📥 Import Database')
+        import_db_action.triggered.connect(self.import_database)
+        
+        file_menu.addSeparator()
+        
+        exit_action = file_menu.addAction('Exit')
+        exit_action.triggered.connect(self.close)
+        
+        # Tools menu
+        tools_menu = menubar.addMenu('Tools')
+        
+        backup_action = tools_menu.addAction('💾 Backup Database')
+        backup_action.triggered.connect(self.backup_database)
+        
+        audit_log_action = tools_menu.addAction('📋 View Audit Log')
+        audit_log_action.triggered.connect(self.view_audit_log)
+        
+        tools_menu.addSeparator()
+        
+        change_password_action = tools_menu.addAction('🔑 Change Password')
+        change_password_action.triggered.connect(self.change_password)
+        
+        # Help menu
+        help_menu = menubar.addMenu('Help')
+        about_action = help_menu.addAction('About')
+        about_action.triggered.connect(self.show_about)
+        
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout()
@@ -172,19 +780,42 @@ class LaptopInspectorApp(QMainWindow):
         # Tab 1: New Inspection
         tabs.addTab(self.create_inspection_tab(), "New Inspection")
         
-        # Tab 2: Inspection History
+        # Tab 2: PR Templates
+        tabs.addTab(self.create_templates_tab(), "📋 PR Templates")
+        
+        # Tab 3: Pending Inspections
+        tabs.addTab(self.create_pending_tab(), "⏳ Pending Inspections")
+        
+        # Tab 4: Inspection History
         tabs.addTab(self.create_history_tab(), "Inspection History")
         
-        # Tab 3: Comparison Reports
+        # Tab 5: Comparison Reports
         tabs.addTab(self.create_comparison_tab(), "Spec Comparison")
         
-        # Tab 4: Analytics (NEW)
+        # Tab 6: Analytics
         tabs.addTab(self.create_analytics_tab(), "Analytics")
         
     def create_inspection_tab(self):
         widget = QWidget()
         layout = QVBoxLayout()
         widget.setLayout(layout)
+        
+        # Quick Actions at top
+        quick_actions_layout = QHBoxLayout()
+        
+        self.load_pending_button = QPushButton("⏳ Load Pending Inspection")
+        self.load_pending_button.clicked.connect(self.quick_load_pending)
+        self.load_pending_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
+        
+        self.load_template_button = QPushButton("📋 Load from Template")
+        self.load_template_button.clicked.connect(self.quick_load_template)
+        self.load_template_button.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 8px;")
+        
+        quick_actions_layout.addWidget(self.load_pending_button)
+        quick_actions_layout.addWidget(self.load_template_button)
+        quick_actions_layout.addStretch()
+        
+        layout.addLayout(quick_actions_layout)
         
         # Inspection Header
         header_group = QGroupBox("Inspection Details")
@@ -348,6 +979,108 @@ class LaptopInspectorApp(QMainWindow):
         
         return widget
 
+    def create_templates_tab(self):
+        """Create PR Templates management tab"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        widget.setLayout(layout)
+        
+        # Header with buttons
+        header_layout = QHBoxLayout()
+        
+        title = QLabel("PR Specification Templates")
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        
+        self.new_template_button = QPushButton("➕ New Template")
+        self.new_template_button.clicked.connect(self.create_new_template)
+        self.new_template_button.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px;")
+        header_layout.addWidget(self.new_template_button)
+        
+        layout.addLayout(header_layout)
+        
+        # Templates table
+        self.templates_table = QTableWidget()
+        self.templates_table.setColumnCount(6)
+        self.templates_table.setHorizontalHeaderLabels([
+            "Template Name", "Agency", "CPU", "RAM", "Storage", "Actions"
+        ])
+        self.templates_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.templates_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.templates_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.templates_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.templates_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.templates_table.setColumnWidth(5, 280)  # Fixed width for Actions column
+        self.templates_table.setSelectionBehavior(QTableWidget.SelectRows)
+        
+        layout.addWidget(self.templates_table)
+        
+        # Load templates
+        self.load_templates()
+        
+        return widget
+    
+    def create_pending_tab(self):
+        """Create Pending Inspections management tab"""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        widget.setLayout(layout)
+        
+        # Header with buttons
+        header_layout = QHBoxLayout()
+        
+        title = QLabel("Pending Inspections Queue")
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        
+        self.new_pending_button = QPushButton("➕ New Pending Inspection")
+        self.new_pending_button.clicked.connect(self.create_new_pending)
+        self.new_pending_button.setStyleSheet("background-color: #FF9800; color: white; padding: 8px;")
+        header_layout.addWidget(self.new_pending_button)
+        
+        layout.addLayout(header_layout)
+        
+        # Info label
+        info_label = QLabel("💡 Tip: Create multiple pending inspections in advance, then complete them one by one as you inspect each laptop.")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("background-color: #E3F2FD; padding: 8px; border-radius: 4px;")
+        layout.addWidget(info_label)
+        
+        # Pending inspections table
+        self.pending_table = QTableWidget()
+        self.pending_table.setColumnCount(7)
+        self.pending_table.setHorizontalHeaderLabels([
+            "PR Number", "Agency", "Model", "CPU", "RAM", "Storage", "Actions"
+        ])
+        self.pending_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.pending_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.pending_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.pending_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.pending_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.pending_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.pending_table.setColumnWidth(6, 250)  # Fixed width for Actions column
+        self.pending_table.setSelectionBehavior(QTableWidget.SelectRows)
+        
+        layout.addWidget(self.pending_table)
+        
+        # Statistics
+        self.pending_stats_label = QLabel()
+        self.pending_stats_label.setStyleSheet("font-weight: bold; padding: 8px;")
+        layout.addWidget(self.pending_stats_label)
+        
+        # Load pending inspections
+        self.load_pending_inspections()
+        
+        return widget
+
     def create_history_tab(self):
         widget = QWidget()
         layout = QVBoxLayout()
@@ -412,8 +1145,11 @@ class LaptopInspectorApp(QMainWindow):
     # === HARDWARE DETECTION METHODS ===
     
     def detect_hardware(self):
-        """Enhanced hardware detection with network testing"""
+        """Enhanced hardware detection with comprehensive system information"""
         try:
+            self.specs_display.setText("Detecting hardware specifications...\n")
+            QApplication.processEvents()
+            
             specs = {}
             
             # CPU Information
@@ -422,16 +1158,19 @@ class LaptopInspectorApp(QMainWindow):
                 'Name': platform.processor(),
                 'Cores': psutil.cpu_count(logical=False),
                 'Threads': psutil.cpu_count(logical=True),
-                'Max Frequency': f"{cpu_freq.max:.2f} MHz" if cpu_freq else "N/A"
+                'Max Frequency': f"{cpu_freq.max:.2f} MHz" if cpu_freq else "N/A",
+                'Current Frequency': f"{cpu_freq.current:.2f} MHz" if cpu_freq else "N/A"
             }
             
-            # RAM Information
+            # RAM Information with details
             memory = psutil.virtual_memory()
             specs['RAM'] = {
                 'Total': f"{memory.total // (1024**3)} GB",
                 'Available': f"{memory.available // (1024**3)} GB",
-                'Used': f"{memory.used // (1024**3)} GB"
+                'Used': f"{memory.used // (1024**3)} GB",
+                'Usage Percent': f"{memory.percent}%"
             }
+            specs['RAM'].update(self.get_ram_details())
             
             # Storage Information
             specs['Storage'] = self.get_storage_info()
@@ -439,9 +1178,15 @@ class LaptopInspectorApp(QMainWindow):
             # Graphics Information
             specs['Graphics'] = self.get_graphics_info()
             
+            # Display Information (NEW)
+            specs['Display'] = self.get_display_info()
+            
             # Network Information with connectivity test
             specs['Network'] = self.get_network_info()
             specs['Network']['Connectivity_Test'] = self.test_network_connectivity()
+            
+            # Peripheral Devices (NEW)
+            specs['Peripherals'] = self.get_peripheral_devices()
             
             # Battery Information (if available)
             specs['Battery'] = self.get_battery_info()
@@ -451,17 +1196,25 @@ class LaptopInspectorApp(QMainWindow):
                 'OS': f"{platform.system()} {platform.version()}",
                 'Architecture': platform.architecture()[0],
                 'Hostname': platform.node(),
-                'System Serial': self.get_system_serial_number()  # Add this line
+                'System Serial': self.get_system_serial_number()
             }
             
-            # BIOS/Serial Information
+            # BIOS/Firmware Information
             specs['BIOS'] = self.get_bios_info()
+            
+            # Warranty Information (NEW)
+            specs['Warranty'] = self.get_warranty_info(specs['System']['System Serial'])
             
             self.display_specs(specs)
             self.current_inspection['detected_specs'] = specs
             
+            self.log_action("Hardware Detection", f"Serial: {specs['System']['System Serial']}")
+            QMessageBox.information(self, "Success", "Hardware detection completed successfully!")
+            
         except Exception as e:
-            QMessageBox.critical(self, "Detection Error", f"Error detecting hardware: {str(e)}")
+            error_msg = f"Error detecting hardware: {str(e)}"
+            self.specs_display.setText(error_msg)
+            QMessageBox.critical(self, "Detection Error", error_msg)
 
     def get_storage_info(self):
         """Get storage device information"""
@@ -670,6 +1423,165 @@ class LaptopInspectorApp(QMainWindow):
             return "Internet: Connected" if result.returncode == 0 else "Internet: No Connection"
         except:
             return "Internet: Test Failed"
+    
+    def get_ram_details(self) -> Dict:
+        """Get detailed RAM information including type and speed"""
+        ram_details = {}
+        try:
+            if platform.system() == "Windows":
+                # Get RAM type and speed
+                result = subprocess.run([
+                    'wmic', 'memorychip', 'get', 'capacity,speed,memorytype'
+                ], capture_output=True, text=True, shell=True)
+                
+                lines = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'Capacity' not in line]
+                
+                if lines:
+                    # Parse RAM details
+                    total_modules = len(lines)
+                    speeds = []
+                    types = []
+                    
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            speeds.append(parts[1] if len(parts) > 1 else "Unknown")
+                            types.append(self.get_memory_type_name(parts[2] if len(parts) > 2 else "0"))
+                    
+                    ram_details['Modules'] = total_modules
+                    ram_details['Speed'] = f"{speeds[0]} MHz" if speeds else "Unknown"
+                    ram_details['Type'] = types[0] if types else "Unknown"
+        except Exception as e:
+            ram_details['Details'] = f"Could not retrieve RAM details: {str(e)}"
+        
+        return ram_details
+    
+    def get_memory_type_name(self, type_code: str) -> str:
+        """Convert memory type code to name"""
+        memory_types = {
+            "20": "DDR",
+            "21": "DDR2",
+            "24": "DDR3",
+            "26": "DDR4",
+            "34": "DDR5"
+        }
+        return memory_types.get(type_code, f"Type {type_code}")
+    
+    def get_display_info(self) -> Dict:
+        """Get display/monitor information"""
+        display_info = {}
+        try:
+            if platform.system() == "Windows":
+                # Get monitor information
+                result = subprocess.run([
+                    'wmic', 'path', 'Win32_DesktopMonitor', 'get', 'ScreenHeight,ScreenWidth,Name'
+                ], capture_output=True, text=True, shell=True)
+                
+                lines = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'Name' not in line and 'ScreenHeight' not in line]
+                
+                if lines and lines[0]:
+                    parts = lines[0].split()
+                    if len(parts) >= 2:
+                        display_info['Resolution'] = f"{parts[1]}x{parts[0]}" if parts[0].isdigit() else "Unable to detect"
+                        display_info['Name'] = ' '.join(parts[2:]) if len(parts) > 2 else "Built-in Display"
+                else:
+                    display_info['Resolution'] = "Unable to detect"
+                    display_info['Name'] = "Built-in Display"
+                
+                # Try to get more details using PowerShell
+                ps_script = """
+                Add-Type -AssemblyName System.Windows.Forms
+                [System.Windows.Forms.Screen]::PrimaryScreen | Select-Object -ExpandProperty Bounds | ConvertTo-Json
+                """
+                result = subprocess.run([
+                    'powershell', '-Command', ps_script
+                ], capture_output=True, text=True, shell=True, timeout=5)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    try:
+                        screen_data = json.loads(result.stdout)
+                        display_info['Resolution'] = f"{screen_data.get('Width', 0)}x{screen_data.get('Height', 0)}"
+                    except:
+                        pass
+                        
+        except Exception as e:
+            display_info['Error'] = f"Could not detect display: {str(e)}"
+        
+        return display_info if display_info else {'Info': 'Display detection unavailable'}
+    
+    def get_peripheral_devices(self) -> Dict:
+        """Detect peripheral devices (webcam, audio, USB devices)"""
+        peripherals = {}
+        try:
+            if platform.system() == "Windows":
+                # Detect webcams
+                result = subprocess.run([
+                    'wmic', 'path', 'Win32_PnPEntity', 'where', '"Name like \'%camera%\'"', 'get', 'Name'
+                ], capture_output=True, text=True, shell=True, timeout=10)
+                
+                cameras = [line.strip() for line in result.stdout.split('\n') 
+                          if line.strip() and 'Name' not in line]
+                peripherals['Webcam'] = cameras[0] if cameras else "No webcam detected"
+                
+                # Detect audio devices
+                result = subprocess.run([
+                    'wmic', 'sounddev', 'get', 'name'
+                ], capture_output=True, text=True, shell=True, timeout=10)
+                
+                audio = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'Name' not in line]
+                peripherals['Audio Devices'] = audio[:2] if audio else ["No audio devices"]
+                
+                # Detect USB devices
+                result = subprocess.run([
+                    'wmic', 'path', 'Win32_USBControllerDevice', 'get', 'Dependent'
+                ], capture_output=True, text=True, shell=True, timeout=10)
+                
+                usb_count = len([line for line in result.stdout.split('\n') 
+                               if 'USB' in line.upper()])
+                peripherals['USB Devices'] = f"{usb_count} USB devices connected"
+                
+                # Detect Bluetooth
+                result = subprocess.run([
+                    'wmic', 'path', 'Win32_PnPEntity', 'where', '"Name like \'%bluetooth%\'"', 'get', 'Name'
+                ], capture_output=True, text=True, shell=True, timeout=10)
+                
+                bluetooth = [line.strip() for line in result.stdout.split('\n') 
+                           if line.strip() and 'Name' not in line]
+                peripherals['Bluetooth'] = "Available" if bluetooth else "Not detected"
+                
+        except Exception as e:
+            peripherals['Error'] = f"Could not detect peripherals: {str(e)}"
+        
+        return peripherals if peripherals else {'Info': 'Peripheral detection unavailable'}
+    
+    def get_warranty_info(self, serial_number: str) -> Dict:
+        """Get warranty information (basic implementation)"""
+        warranty_info = {}
+        try:
+            if platform.system() == "Windows":
+                # Get system manufacturer
+                result = subprocess.run([
+                    'wmic', 'computersystem', 'get', 'manufacturer,model'
+                ], capture_output=True, text=True, shell=True)
+                
+                lines = [line.strip() for line in result.stdout.split('\n') 
+                        if line.strip() and 'Manufacturer' not in line]
+                
+                if lines and lines[0]:
+                    parts = lines[0].split(maxsplit=1)
+                    warranty_info['Manufacturer'] = parts[0] if parts else "Unknown"
+                    warranty_info['Model'] = parts[1] if len(parts) > 1 else "Unknown"
+                
+                warranty_info['Serial Number'] = serial_number
+                warranty_info['Note'] = "Check manufacturer website for warranty details"
+                
+        except Exception as e:
+            warranty_info['Error'] = f"Could not retrieve warranty info: {str(e)}"
+        
+        return warranty_info if warranty_info else {'Info': 'Warranty info unavailable'}
 
     def display_specs(self, specs):
         """Display the collected specifications"""
@@ -760,15 +1672,23 @@ Overall Performance: {cpu_assessment}
         dialog.exec()
 
     def add_digital_signatures(self):
-        """Add digital signatures to inspection"""
-        dialog = DigitalSignatureDialog(self)
+        """Add digital signatures and certificate to inspection"""
+        dialog = DigitalSignatureDialog(self, self.user_info['username'])
         if dialog.exec():
-            inspector_sig, approver_sig = dialog.get_signatures()
-            if inspector_sig:
-                self.current_inspection['inspector_signature'] = inspector_sig
-            if approver_sig:
-                self.current_inspection['approver_signature'] = approver_sig
-            QMessageBox.information(self, "Success", "Digital signatures added successfully!")
+            sig_data = dialog.get_signatures()
+            self.current_inspection['inspector_signature'] = sig_data[0]
+            self.current_inspection['inspector_id'] = sig_data[1]
+            self.current_inspection['approver_signature'] = sig_data[2]
+            self.current_inspection['approver_id'] = sig_data[3]
+            self.current_inspection['signature_timestamp'] = sig_data[4]
+            self.current_inspection['certificate_id'] = sig_data[5]
+            
+            msg = "Digital signatures added successfully!"
+            if sig_data[5]:
+                msg += f"\n\nCertificate ID: {sig_data[5]}"
+            QMessageBox.information(self, "Success", msg)
+            
+            self.log_action("Add Signatures", f"Certificate: {sig_data[5]}")
 
     def validate_specifications(self):
         """Comprehensive specification validation with pass/fail"""
@@ -812,24 +1732,57 @@ Overall Performance: {cpu_assessment}
         self.inspection_results['overall_status'] = overall_status
 
     def validate_cpu(self, pr_cpu: str, actual_cpu: Dict) -> Dict:
-        """Validate CPU specifications"""
+        """Validate CPU specifications with 'equal or better' logic"""
         if not pr_cpu:
             return {'component': 'CPU', 'status': 'PASS', 'details': 'No PR specification provided'}
         
         actual_name = actual_cpu['Name'].upper()
+        pr_upper = pr_cpu.upper()
         
-        # Basic matching logic - can be enhanced
-        if pr_cpu in actual_name:
-            return {'component': 'CPU', 'status': 'PASS', 'details': f"Matches: {actual_name}"}
+        # CPU tier comparison (higher is better)
+        cpu_tiers = {
+            'I9': 9, 'RYZEN 9': 9,
+            'I7': 7, 'RYZEN 7': 7, 'CORE I7': 7,
+            'I5': 5, 'RYZEN 5': 5, 'CORE I5': 5,
+            'I3': 3, 'RYZEN 3': 3, 'CORE I3': 3
+        }
+        
+        pr_tier = None
+        actual_tier = None
+        
+        for cpu_name, tier_value in cpu_tiers.items():
+            if cpu_name in pr_upper:
+                pr_tier = tier_value
+            if cpu_name in actual_name:
+                actual_tier = tier_value
+        
+        # If we can compare tiers
+        if pr_tier and actual_tier:
+            if actual_tier >= pr_tier:
+                return {
+                    'component': 'CPU',
+                    'status': 'PASS',
+                    'details': f"✓ Actual CPU (tier {actual_tier}) meets or exceeds PR requirement (tier {pr_tier})"
+                }
+            else:
+                return {
+                    'component': 'CPU',
+                    'status': 'FAIL',
+                    'details': f"✗ Actual CPU (tier {actual_tier}) is below PR requirement (tier {pr_tier})"
+                }
+        
+        # Fallback to string matching
+        if pr_upper in actual_name:
+            return {'component': 'CPU', 'status': 'PASS', 'details': f"✓ Exact match: {actual_name}"}
         else:
             return {
-                'component': 'CPU', 
-                'status': 'FAIL', 
-                'details': f"PR: {pr_cpu}, Actual: {actual_name} - DOES NOT MATCH"
+                'component': 'CPU',
+                'status': 'WARNING',
+                'details': f"⚠ Cannot verify: PR: {pr_cpu}, Actual: {actual_name}"
             }
 
     def validate_ram(self, pr_ram: str, actual_ram: Dict) -> Dict:
-        """Validate RAM specifications"""
+        """Validate RAM specifications with 'equal or better' logic"""
         if not pr_ram:
             return {'component': 'RAM', 'status': 'PASS', 'details': 'No PR specification provided'}
         
@@ -840,24 +1793,26 @@ Overall Performance: {cpu_assessment}
             
             if pr_gb and actual_gb:
                 if actual_gb >= pr_gb:
+                    status_icon = "✓" if actual_gb == pr_gb else "✓✓"
+                    extra = f" (exceeds by {actual_gb - pr_gb}GB)" if actual_gb > pr_gb else ""
                     return {
-                        'component': 'RAM', 
-                        'status': 'PASS', 
-                        'details': f"Actual ({actual_gb}GB) meets PR requirement ({pr_gb}GB)"
+                        'component': 'RAM',
+                        'status': 'PASS',
+                        'details': f"{status_icon} Actual ({actual_gb}GB) meets or exceeds PR requirement ({pr_gb}GB){extra}"
                     }
                 else:
                     return {
-                        'component': 'RAM', 
-                        'status': 'FAIL', 
-                        'details': f"Actual ({actual_gb}GB) less than PR requirement ({pr_gb}GB)"
+                        'component': 'RAM',
+                        'status': 'FAIL',
+                        'details': f"✗ Actual ({actual_gb}GB) is {pr_gb - actual_gb}GB less than PR requirement ({pr_gb}GB)"
                     }
         except:
             pass
         
         return {
-            'component': 'RAM', 
-            'status': 'CHECK', 
-            'details': f"Could not validate: PR: {pr_ram}, Actual: {actual_ram['Total']}"
+            'component': 'RAM',
+            'status': 'WARNING',
+            'details': f"⚠ Could not validate: PR: {pr_ram}, Actual: {actual_ram['Total']}"
         }
 
     def validate_storage(self, pr_storage: str, actual_storage: Dict) -> Dict:
@@ -952,27 +1907,51 @@ Overall Performance: {cpu_assessment}
             
             cursor.execute('''
                 INSERT INTO inspections 
-                (inspection_date, inspector_name, inspector_signature, approver_signature,
+                (inspection_date, inspector_name, inspector_signature, inspector_id,
+                 approver_signature, approver_id, certificate_id, signature_timestamp,
                  agency_name, pr_number, serial_number, laptop_model, inspection_data, 
-                 overall_status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 overall_status, created_at, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 self.inspection_date.date().toString("yyyy-MM-dd"),
                 self.inspector_name.text(),
                 self.current_inspection.get('inspector_signature', ''),
+                self.current_inspection.get('inspector_id', ''),
                 self.current_inspection.get('approver_signature', ''),
+                self.current_inspection.get('approver_id', ''),
+                self.current_inspection.get('certificate_id', ''),
+                self.current_inspection.get('signature_timestamp', ''),
                 self.agency_name.text(),
                 self.pr_number.text(),
                 self.serial_number.text(),
                 self.laptop_model.text(),
                 json.dumps(inspection_data),
                 self.inspection_results.get('overall_status', 'NOT_VALIDATED'),
-                datetime.now().isoformat()
+                datetime.now().isoformat(),
+                self.user_info['username']
             ))
             
             conn.commit()
             conn.close()
             
+            # Mark pending inspection as completed if it was loaded from pending
+            if hasattr(self, 'current_pending_id') and self.current_pending_id:
+                try:
+                    conn = sqlite3.connect(self.db_path)
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE pending_inspections 
+                        SET status = 'completed' 
+                        WHERE id = ?
+                    ''', (self.current_pending_id,))
+                    conn.commit()
+                    conn.close()
+                    self.current_pending_id = None
+                    self.load_pending_inspections()  # Refresh pending list
+                except:
+                    pass  # Don't fail the save if pending update fails
+            
+            self.log_action("Save Inspection", f"S/N: {self.serial_number.text()}, PR: {self.pr_number.text()}")
             QMessageBox.information(self, "Success", "Inspection saved successfully!")
             
         except Exception as e:
@@ -1194,6 +2173,783 @@ Overall Performance: {cpu_assessment}
             
         except Exception as e:
             self.analytics_text.setText(f"Error generating analytics: {str(e)}")
+    
+    def export_database(self):
+        """Export database to a file"""
+        try:
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Database",
+                f"coa_inspections_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                "Database Files (*.db);;All Files (*)"
+            )
+            
+            if filename:
+                import shutil
+                shutil.copy2(self.db_path, filename)
+                self.log_action("Export Database", f"Exported to: {filename}")
+                QMessageBox.information(self, "Success", f"Database exported successfully to:\n{filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Error exporting database: {str(e)}")
+    
+    def import_database(self):
+        """Import database from a file"""
+        try:
+            reply = QMessageBox.question(
+                self,
+                "Import Database",
+                "WARNING: Importing will replace your current database.\nMake sure you have a backup!\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                filename, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Import Database",
+                    "",
+                    "Database Files (*.db);;All Files (*)"
+                )
+                
+                if filename:
+                    import shutil
+                    # Create backup before import
+                    backup_name = f"coa_inspections_backup_before_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+                    shutil.copy2(self.db_path, backup_name)
+                    
+                    # Import new database
+                    shutil.copy2(filename, self.db_path)
+                    
+                    self.log_action("Import Database", f"Imported from: {filename}")
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"Database imported successfully!\nBackup saved as: {backup_name}"
+                    )
+                    
+                    # Reload inspections
+                    self.load_inspections()
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Error importing database: {str(e)}")
+    
+    def backup_database(self):
+        """Create a backup of the database"""
+        try:
+            backup_name = f"coa_inspections_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            import shutil
+            shutil.copy2(self.db_path, backup_name)
+            
+            self.log_action("Backup Database", f"Backup created: {backup_name}")
+            QMessageBox.information(
+                self,
+                "Backup Created",
+                f"Database backup created successfully:\n{backup_name}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Backup Error", f"Error creating backup: {str(e)}")
+    
+    def view_audit_log(self):
+        """View audit log of all actions"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT timestamp, username, action, details 
+                FROM audit_log 
+                ORDER BY timestamp DESC 
+                LIMIT 100
+            ''')
+            
+            logs = cursor.fetchall()
+            conn.close()
+            
+            # Create dialog to display logs
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Audit Log")
+            dialog.resize(800, 600)
+            
+            layout = QVBoxLayout()
+            
+            log_table = QTableWidget()
+            log_table.setColumnCount(4)
+            log_table.setHorizontalHeaderLabels(["Timestamp", "User", "Action", "Details"])
+            log_table.setRowCount(len(logs))
+            
+            for row, log in enumerate(logs):
+                for col, value in enumerate(log):
+                    log_table.setItem(row, col, QTableWidgetItem(str(value)))
+            
+            log_table.resizeColumnsToContents()
+            layout.addWidget(log_table)
+            
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(dialog.accept)
+            layout.addWidget(close_button)
+            
+            dialog.setLayout(layout)
+            dialog.exec()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error viewing audit log: {str(e)}")
+    
+    def show_about(self):
+        """Show about dialog"""
+        about_text = """
+        <h2>COA Laptop Inspection System</h2>
+        <p><b>Version:</b> 2.5</p>
+        <p><b>Developer:</b> Commission on Audit</p>
+        <p><b>Purpose:</b> Comprehensive laptop hardware inspection and validation system</p>
+        <br>
+        <p><b>Features:</b></p>
+        <ul>
+            <li>Automatic hardware detection</li>
+            <li>Purchase request validation</li>
+            <li>Digital signatures with certificates</li>
+            <li>Performance testing</li>
+            <li>Comprehensive reporting (PDF & Excel)</li>
+            <li>Database backup and export</li>
+            <li>Audit logging</li>
+        </ul>
+        <br>
+        <p><i>© 2025 Commission on Audit. All rights reserved.</i></p>
+        """
+        
+        QMessageBox.about(self, "About", about_text)
+    
+    def change_password(self):
+        """Change user password"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Change Password")
+        dialog.setModal(True)
+        dialog.setFixedSize(400, 250)
+        
+        layout = QVBoxLayout()
+        
+        info_label = QLabel(f"Change password for user: {self.user_info['username']}")
+        info_label.setStyleSheet("font-weight: bold; padding: 8px;")
+        layout.addWidget(info_label)
+        
+        form_layout = QFormLayout()
+        
+        current_password = QLineEdit()
+        current_password.setEchoMode(QLineEdit.Password)
+        current_password.setPlaceholderText("Enter current password")
+        form_layout.addRow("Current Password:*", current_password)
+        
+        new_password = QLineEdit()
+        new_password.setEchoMode(QLineEdit.Password)
+        new_password.setPlaceholderText("Enter new password (min 6 chars)")
+        form_layout.addRow("New Password:*", new_password)
+        
+        confirm_password = QLineEdit()
+        confirm_password.setEchoMode(QLineEdit.Password)
+        confirm_password.setPlaceholderText("Re-enter new password")
+        form_layout.addRow("Confirm Password:*", confirm_password)
+        
+        layout.addLayout(form_layout)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec():
+            current_pass = current_password.text()
+            new_pass = new_password.text()
+            confirm_pass = confirm_password.text()
+            
+            # Validate inputs
+            if not all([current_pass, new_pass, confirm_pass]):
+                QMessageBox.warning(self, "Error", "All fields are required.")
+                return
+            
+            # Verify current password
+            creds_file = Path("coa_credentials.dat")
+            if not creds_file.exists():
+                QMessageBox.critical(self, "Error", "Credentials file not found.")
+                return
+            
+            try:
+                encoded = creds_file.read_text()
+                credentials = json.loads(base64.b64decode(encoded).decode())
+                current_hash = hashlib.sha256(current_pass.encode()).hexdigest()
+                
+                if credentials['password'] != current_hash:
+                    QMessageBox.warning(self, "Error", "Current password is incorrect.")
+                    return
+                
+                # Validate new password
+                if len(new_pass) < 6:
+                    QMessageBox.warning(self, "Error", "New password must be at least 6 characters.")
+                    return
+                
+                if new_pass != confirm_pass:
+                    QMessageBox.warning(self, "Error", "New passwords do not match.")
+                    return
+                
+                if current_pass == new_pass:
+                    QMessageBox.warning(self, "Error", "New password must be different from current password.")
+                    return
+                
+                # Save new password
+                new_hash = hashlib.sha256(new_pass.encode()).hexdigest()
+                credentials['password'] = new_hash
+                credentials['last_changed'] = datetime.now().isoformat()
+                
+                encoded = base64.b64encode(json.dumps(credentials).encode()).decode()
+                creds_file.write_text(encoded)
+                
+                self.log_action("Change Password", "Password changed successfully")
+                QMessageBox.information(
+                    self, 
+                    "Success", 
+                    "Password changed successfully!\n\nPlease remember your new password."
+                )
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error changing password: {str(e)}")
+    
+    # === TEMPLATE MANAGEMENT METHODS ===
+    
+    def load_templates(self):
+        """Load all PR templates from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, template_name, agency_name, pr_cpu, pr_ram, pr_storage
+                FROM pr_templates
+                ORDER BY template_name
+            ''')
+            templates = cursor.fetchall()
+            conn.close()
+            
+            self.templates_table.setRowCount(len(templates))
+            
+            for row, template in enumerate(templates):
+                template_id, name, agency, cpu, ram, storage = template
+                
+                self.templates_table.setItem(row, 0, QTableWidgetItem(name))
+                self.templates_table.setItem(row, 1, QTableWidgetItem(agency or "N/A"))
+                self.templates_table.setItem(row, 2, QTableWidgetItem(cpu))
+                self.templates_table.setItem(row, 3, QTableWidgetItem(ram))
+                self.templates_table.setItem(row, 4, QTableWidgetItem(storage))
+                
+                # Actions buttons
+                actions_widget = QWidget()
+                actions_layout = QHBoxLayout()
+                actions_layout.setContentsMargins(2, 2, 2, 2)
+                actions_layout.setSpacing(4)
+                
+                use_btn = QPushButton("▶️ Use")
+                use_btn.clicked.connect(lambda checked, tid=template_id: self.use_template(tid))
+                use_btn.setStyleSheet("padding: 6px 8px; background-color: #4CAF50; color: white; font-weight: bold;")
+                use_btn.setMinimumWidth(70)
+                
+                edit_btn = QPushButton("✏️ Edit")
+                edit_btn.clicked.connect(lambda checked, tid=template_id: self.edit_template(tid))
+                edit_btn.setStyleSheet("padding: 6px 8px;")
+                edit_btn.setMinimumWidth(70)
+                
+                delete_btn = QPushButton("🗑️")
+                delete_btn.clicked.connect(lambda checked, tid=template_id: self.delete_template(tid))
+                delete_btn.setStyleSheet("padding: 6px 8px; background-color: #f44336; color: white;")
+                delete_btn.setMinimumWidth(40)
+                delete_btn.setToolTip("Delete Template")
+                
+                actions_layout.addWidget(use_btn)
+                actions_layout.addWidget(edit_btn)
+                actions_layout.addWidget(delete_btn)
+                actions_layout.addStretch()
+                actions_widget.setLayout(actions_layout)
+                
+                self.templates_table.setCellWidget(row, 5, actions_widget)
+            
+            self.templates_table.resizeRowsToContents()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading templates: {str(e)}")
+    
+    def create_new_template(self):
+        """Create a new PR template"""
+        dialog = PRTemplateDialog(self)
+        if dialog.exec():
+            template_data = dialog.get_template_data()
+            
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO pr_templates 
+                    (template_name, agency_name, pr_cpu, pr_ram, pr_storage, pr_graphics, pr_wifi, pr_notes, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    template_data['template_name'],
+                    template_data['agency_name'],
+                    template_data['pr_cpu'],
+                    template_data['pr_ram'],
+                    template_data['pr_storage'],
+                    template_data['pr_graphics'],
+                    template_data['pr_wifi'],
+                    template_data['pr_notes'],
+                    self.user_info['username'],
+                    datetime.now().isoformat()
+                ))
+                conn.commit()
+                conn.close()
+                
+                self.log_action("Create Template", f"Template: {template_data['template_name']}")
+                QMessageBox.information(self, "Success", "Template created successfully!")
+                self.load_templates()
+                
+            except sqlite3.IntegrityError:
+                QMessageBox.warning(self, "Duplicate", "A template with this name already exists.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error creating template: {str(e)}")
+    
+    def edit_template(self, template_id):
+        """Edit an existing template"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM pr_templates WHERE id = ?', (template_id,))
+            template = cursor.fetchone()
+            conn.close()
+            
+            if template:
+                template_data = {
+                    'template_name': template[1],
+                    'agency_name': template[2],
+                    'pr_cpu': template[3],
+                    'pr_ram': template[4],
+                    'pr_storage': template[5],
+                    'pr_graphics': template[6],
+                    'pr_wifi': template[7],
+                    'pr_notes': template[8]
+                }
+                
+                dialog = PRTemplateDialog(self, template_data)
+                if dialog.exec():
+                    updated_data = dialog.get_template_data()
+                    
+                    conn = sqlite3.connect(self.db_path)
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE pr_templates 
+                        SET template_name=?, agency_name=?, pr_cpu=?, pr_ram=?, pr_storage=?, 
+                            pr_graphics=?, pr_wifi=?, pr_notes=?
+                        WHERE id=?
+                    ''', (
+                        updated_data['template_name'],
+                        updated_data['agency_name'],
+                        updated_data['pr_cpu'],
+                        updated_data['pr_ram'],
+                        updated_data['pr_storage'],
+                        updated_data['pr_graphics'],
+                        updated_data['pr_wifi'],
+                        updated_data['pr_notes'],
+                        template_id
+                    ))
+                    conn.commit()
+                    conn.close()
+                    
+                    self.log_action("Edit Template", f"Template: {updated_data['template_name']}")
+                    QMessageBox.information(self, "Success", "Template updated successfully!")
+                    self.load_templates()
+                    
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error editing template: {str(e)}")
+    
+    def delete_template(self, template_id):
+        """Delete a template"""
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            "Are you sure you want to delete this template?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM pr_templates WHERE id = ?', (template_id,))
+                conn.commit()
+                conn.close()
+                
+                self.log_action("Delete Template", f"Template ID: {template_id}")
+                QMessageBox.information(self, "Success", "Template deleted successfully!")
+                self.load_templates()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error deleting template: {str(e)}")
+    
+    def use_template(self, template_id):
+        """Load template specs into new inspection tab"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM pr_templates WHERE id = ?', (template_id,))
+            template = cursor.fetchone()
+            conn.close()
+            
+            if template:
+                self.agency_name.setText(template[2] or "")
+                self.pr_cpu.setText(template[3])
+                self.pr_ram.setText(template[4])
+                self.pr_storage.setText(template[5])
+                self.pr_graphics.setText(template[6] or "")
+                self.pr_wifi.setText(template[7] or "")
+                self.pr_notes.setText(template[8] or "")
+                
+                # Switch to inspection tab
+                tabs = self.centralWidget().findChild(QTabWidget)
+                if tabs:
+                    tabs.setCurrentIndex(0)
+                
+                QMessageBox.information(self, "Template Loaded", f"Template '{template[1]}' loaded successfully!\nFill in PR Number and Serial Number to continue.")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error using template: {str(e)}")
+    
+    # === PENDING INSPECTIONS MANAGEMENT METHODS ===
+    
+    def load_pending_inspections(self):
+        """Load all pending inspections from database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, pr_number, agency_name, laptop_model, pr_cpu, pr_ram, pr_storage, status
+                FROM pending_inspections
+                WHERE status = 'pending'
+                ORDER BY created_at DESC
+            ''')
+            pending = cursor.fetchall()
+            conn.close()
+            
+            self.pending_table.setRowCount(len(pending))
+            
+            for row, inspection in enumerate(pending):
+                insp_id, pr_num, agency, model, cpu, ram, storage, status = inspection
+                
+                self.pending_table.setItem(row, 0, QTableWidgetItem(pr_num))
+                self.pending_table.setItem(row, 1, QTableWidgetItem(agency))
+                self.pending_table.setItem(row, 2, QTableWidgetItem(model or "TBD"))
+                self.pending_table.setItem(row, 3, QTableWidgetItem(cpu))
+                self.pending_table.setItem(row, 4, QTableWidgetItem(ram))
+                self.pending_table.setItem(row, 5, QTableWidgetItem(storage))
+                
+                # Actions buttons
+                actions_widget = QWidget()
+                actions_layout = QHBoxLayout()
+                actions_layout.setContentsMargins(2, 2, 2, 2)
+                actions_layout.setSpacing(4)
+                
+                start_btn = QPushButton("▶️ Start")
+                start_btn.clicked.connect(lambda checked, pid=insp_id: self.start_pending_inspection(pid))
+                start_btn.setStyleSheet("padding: 6px 8px; background-color: #4CAF50; color: white; font-weight: bold;")
+                start_btn.setMinimumWidth(80)
+                
+                edit_btn = QPushButton("✏️")
+                edit_btn.clicked.connect(lambda checked, pid=insp_id: self.edit_pending(pid))
+                edit_btn.setStyleSheet("padding: 6px 8px;")
+                edit_btn.setMinimumWidth(40)
+                edit_btn.setToolTip("Edit Pending Inspection")
+                
+                delete_btn = QPushButton("🗑️")
+                delete_btn.clicked.connect(lambda checked, pid=insp_id: self.delete_pending(pid))
+                delete_btn.setStyleSheet("padding: 6px 8px; background-color: #f44336; color: white;")
+                delete_btn.setMinimumWidth(40)
+                delete_btn.setToolTip("Delete Pending Inspection")
+                
+                actions_layout.addWidget(start_btn)
+                actions_layout.addWidget(edit_btn)
+                actions_layout.addWidget(delete_btn)
+                actions_layout.addStretch()
+                actions_widget.setLayout(actions_layout)
+                
+                self.pending_table.setCellWidget(row, 6, actions_widget)
+            
+            self.pending_table.resizeRowsToContents()
+            
+            # Update statistics
+            self.pending_stats_label.setText(f"📊 Total Pending Inspections: {len(pending)}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading pending inspections: {str(e)}")
+    
+    def create_new_pending(self):
+        """Create a new pending inspection"""
+        # Get templates for dropdown
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, template_name, agency_name, pr_cpu, pr_ram, pr_storage, pr_graphics, pr_wifi, pr_notes FROM pr_templates')
+            templates = [dict(zip(['id', 'template_name', 'agency_name', 'pr_cpu', 'pr_ram', 'pr_storage', 'pr_graphics', 'pr_wifi', 'pr_notes'], row)) for row in cursor.fetchall()]
+            conn.close()
+            
+            dialog = PendingInspectionDialog(self, templates)
+            if dialog.exec():
+                pending_data = dialog.get_pending_data()
+                
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO pending_inspections 
+                    (agency_name, pr_number, laptop_model, expected_serial, pr_cpu, pr_ram, pr_storage, 
+                     pr_graphics, pr_wifi, pr_notes, status, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                ''', (
+                    pending_data['agency_name'],
+                    pending_data['pr_number'],
+                    pending_data['laptop_model'],
+                    pending_data['expected_serial'],
+                    pending_data['pr_cpu'],
+                    pending_data['pr_ram'],
+                    pending_data['pr_storage'],
+                    pending_data['pr_graphics'],
+                    pending_data['pr_wifi'],
+                    pending_data['pr_notes'],
+                    self.user_info['username'],
+                    datetime.now().isoformat()
+                ))
+                conn.commit()
+                conn.close()
+                
+                self.log_action("Create Pending Inspection", f"PR: {pending_data['pr_number']}")
+                QMessageBox.information(self, "Success", "Pending inspection created successfully!")
+                self.load_pending_inspections()
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error creating pending inspection: {str(e)}")
+    
+    def edit_pending(self, pending_id):
+        """Edit a pending inspection"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM pending_inspections WHERE id = ?', (pending_id,))
+            pending = cursor.fetchone()
+            
+            # Get templates
+            cursor.execute('SELECT id, template_name, agency_name, pr_cpu, pr_ram, pr_storage, pr_graphics, pr_wifi, pr_notes FROM pr_templates')
+            templates = [dict(zip(['id', 'template_name', 'agency_name', 'pr_cpu', 'pr_ram', 'pr_storage', 'pr_graphics', 'pr_wifi', 'pr_notes'], row)) for row in cursor.fetchall()]
+            conn.close()
+            
+            if pending:
+                pending_data = {
+                    'agency_name': pending[1],
+                    'pr_number': pending[2],
+                    'laptop_model': pending[3],
+                    'expected_serial': pending[4],
+                    'pr_cpu': pending[5],
+                    'pr_ram': pending[6],
+                    'pr_storage': pending[7],
+                    'pr_graphics': pending[8],
+                    'pr_wifi': pending[9],
+                    'pr_notes': pending[10]
+                }
+                
+                dialog = PendingInspectionDialog(self, templates, pending_data)
+                if dialog.exec():
+                    updated_data = dialog.get_pending_data()
+                    
+                    conn = sqlite3.connect(self.db_path)
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE pending_inspections 
+                        SET agency_name=?, pr_number=?, laptop_model=?, expected_serial=?, 
+                            pr_cpu=?, pr_ram=?, pr_storage=?, pr_graphics=?, pr_wifi=?, pr_notes=?
+                        WHERE id=?
+                    ''', (
+                        updated_data['agency_name'],
+                        updated_data['pr_number'],
+                        updated_data['laptop_model'],
+                        updated_data['expected_serial'],
+                        updated_data['pr_cpu'],
+                        updated_data['pr_ram'],
+                        updated_data['pr_storage'],
+                        updated_data['pr_graphics'],
+                        updated_data['pr_wifi'],
+                        updated_data['pr_notes'],
+                        pending_id
+                    ))
+                    conn.commit()
+                    conn.close()
+                    
+                    self.log_action("Edit Pending Inspection", f"Pending ID: {pending_id}")
+                    QMessageBox.information(self, "Success", "Pending inspection updated successfully!")
+                    self.load_pending_inspections()
+                    
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error editing pending inspection: {str(e)}")
+    
+    def delete_pending(self, pending_id):
+        """Delete a pending inspection"""
+        reply = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            "Are you sure you want to delete this pending inspection?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM pending_inspections WHERE id = ?', (pending_id,))
+                conn.commit()
+                conn.close()
+                
+                self.log_action("Delete Pending Inspection", f"Pending ID: {pending_id}")
+                QMessageBox.information(self, "Success", "Pending inspection deleted successfully!")
+                self.load_pending_inspections()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error deleting pending inspection: {str(e)}")
+    
+    def start_pending_inspection(self, pending_id):
+        """Start a pending inspection - load data into inspection tab"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM pending_inspections WHERE id = ?', (pending_id,))
+            pending = cursor.fetchone()
+            conn.close()
+            
+            if pending:
+                # Load data into inspection form
+                self.agency_name.setText(pending[1])
+                self.pr_number.setText(pending[2])
+                self.laptop_model.setText(pending[3] or "")
+                self.serial_number.setText(pending[4] or "")
+                self.pr_cpu.setText(pending[5])
+                self.pr_ram.setText(pending[6])
+                self.pr_storage.setText(pending[7])
+                self.pr_graphics.setText(pending[8] or "")
+                self.pr_wifi.setText(pending[9] or "")
+                self.pr_notes.setText(pending[10] or "")
+                
+                # Store pending ID for later marking as completed
+                self.current_pending_id = pending_id
+                
+                # Switch to inspection tab
+                tabs = self.centralWidget().findChild(QTabWidget)
+                if tabs:
+                    tabs.setCurrentIndex(0)
+                
+                QMessageBox.information(
+                    self,
+                    "Inspection Started",
+                    f"Pending inspection loaded!\n\nPR: {pending[2]}\nAgency: {pending[1]}\n\nNext steps:\n1. Fill in Serial Number (if not yet entered)\n2. Auto-Detect Hardware\n3. Validate & Complete"
+                )
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error starting inspection: {str(e)}")
+    
+    def quick_load_pending(self):
+        """Quick load from pending inspections"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, pr_number, agency_name 
+                FROM pending_inspections 
+                WHERE status = 'pending'
+                ORDER BY created_at DESC
+            ''')
+            pending_list = cursor.fetchall()
+            conn.close()
+            
+            if not pending_list:
+                QMessageBox.information(self, "No Pending", "No pending inspections found.\n\nGo to 'Pending Inspections' tab to create some!")
+                return
+            
+            # Create selection dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Select Pending Inspection")
+            dialog.setModal(True)
+            dialog.resize(400, 300)
+            
+            layout = QVBoxLayout()
+            
+            label = QLabel("Select a pending inspection to load:")
+            layout.addWidget(label)
+            
+            list_widget = QListWidget()
+            for pid, pr_num, agency in pending_list:
+                item = QListWidgetItem(f"{pr_num} - {agency}")
+                item.setData(Qt.UserRole, pid)
+                list_widget.addItem(item)
+            
+            list_widget.itemDoubleClicked.connect(dialog.accept)
+            layout.addWidget(list_widget)
+            
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            
+            dialog.setLayout(layout)
+            
+            if dialog.exec() and list_widget.currentItem():
+                selected_id = list_widget.currentItem().data(Qt.UserRole)
+                self.start_pending_inspection(selected_id)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading pending inspection: {str(e)}")
+    
+    def quick_load_template(self):
+        """Quick load from templates"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, template_name, agency_name FROM pr_templates ORDER BY template_name')
+            templates_list = cursor.fetchall()
+            conn.close()
+            
+            if not templates_list:
+                QMessageBox.information(self, "No Templates", "No templates found.\n\nGo to 'PR Templates' tab to create some!")
+                return
+            
+            # Create selection dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Select PR Template")
+            dialog.setModal(True)
+            dialog.resize(400, 300)
+            
+            layout = QVBoxLayout()
+            
+            label = QLabel("Select a template to load:")
+            layout.addWidget(label)
+            
+            list_widget = QListWidget()
+            for tid, template_name, agency in templates_list:
+                item = QListWidgetItem(f"{template_name} ({agency or 'No Agency'})")
+                item.setData(Qt.UserRole, tid)
+                list_widget.addItem(item)
+            
+            list_widget.itemDoubleClicked.connect(dialog.accept)
+            layout.addWidget(list_widget)
+            
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            
+            dialog.setLayout(layout)
+            
+            if dialog.exec() and list_widget.currentItem():
+                selected_id = list_widget.currentItem().data(Qt.UserRole)
+                self.use_template(selected_id)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error loading template: {str(e)}")
             
     def create_comparison_tab(self):
         widget = QWidget()
@@ -1752,10 +3508,15 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    window = LaptopInspectorApp()
-    window.show()
-    
-    sys.exit(app.exec())
+    # Show login dialog first
+    login_dialog = LoginDialog()
+    if login_dialog.exec():
+        if login_dialog.authenticated:
+            window = LaptopInspectorApp(login_dialog.user_info)
+            window.show()
+            sys.exit(app.exec())
+    else:
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
